@@ -169,3 +169,81 @@ select jsonb_build_object('reviews',count(f.rating),'average',round(avg(f.rating
 $$;
 revoke all on function public.kb_reputation(uuid) from public,anon,authenticated;
 grant execute on function public.kb_reputation(uuid) to service_role;
+
+alter table public.kb_listings add column is_test boolean not null default false, add column removed_at timestamptz;
+update public.kb_listings set is_test=true where title ~ '^QA[ _]';
+create table public.kb_pilot_config(
+ id boolean primary key default true check(id),active boolean not null default false,
+ company text not null default 'finnvedsbostader',area text,
+ starts_at timestamptz,ends_at timestamptz,moderator_name text not null default 'Christo van Zyl',
+ checked_at timestamptz,privacy_confirmed boolean not null default false,retention_approved boolean not null default false,
+ participant_limit integer not null default 30 check(participant_limit between 1 and 30)
+);
+insert into public.kb_pilot_config(id) values(true);
+create table public.kb_pilot_participants(owner_hash text primary key,joined_at timestamptz not null default now());
+create table public.kb_support_requests(
+ id uuid primary key default gen_random_uuid(),owner_hash text not null,
+ category text not null check(category in ('support','privacy','abuse')),
+ body text not null check(length(body) between 5 and 2000),answer text not null default '' check(length(answer)<=4000),
+ status text not null default 'pending' check(status in ('pending','answered','closed')),
+ created_at timestamptz not null default now(),updated_at timestamptz not null default now()
+);
+alter table public.kb_pilot_config enable row level security;
+alter table public.kb_pilot_participants enable row level security;
+alter table public.kb_support_requests enable row level security;
+revoke all on public.kb_pilot_config,public.kb_pilot_participants,public.kb_support_requests from public,anon,authenticated;
+grant all on public.kb_pilot_config,public.kb_pilot_participants,public.kb_support_requests to service_role;
+create function public.kb_pilot_admit(p_hash text,p_company text,p_area text) returns jsonb
+language plpgsql security invoker set search_path=public,pg_temp as $$
+declare c public.kb_pilot_config;
+begin
+ select * into c from public.kb_pilot_config where id for update;
+ if not c.active or not c.retention_approved or not c.privacy_confirmed or c.checked_at is null or c.checked_at<now()-interval '24 hours' or c.ends_at is null or now()>=c.ends_at or now()<c.starts_at then
+  return jsonb_build_object('allowed',false,'reason','Piloten är pausad tills operatören har kontrollerat integritet och moderering.');end if;
+ if p_company<>c.company or lower(trim(p_area))<>lower(trim(c.area)) then return jsonb_build_object('allowed',false,'reason','Den begränsade piloten är öppen i '||coalesce(c.area,'valt område')||' för valt bolag.');end if;
+ if not exists(select 1 from public.kb_pilot_participants where owner_hash=p_hash) then
+  if (select count(*) from public.kb_pilot_participants)>=c.participant_limit then return jsonb_build_object('allowed',false,'reason','Pilotens gräns på 30 publicerande eller kontaktande webbläsaridentiteter är nådd.');end if;
+  insert into public.kb_pilot_participants(owner_hash) values(p_hash);
+ end if;
+ if (select count(*) from public.kb_listings where not is_test and status in ('active','reserved'))>=60 then return jsonb_build_object('allowed',false,'reason','Pilotens annonsgräns är nådd.');end if;
+ return jsonb_build_object('allowed',true);
+end $$;
+create function public.kb_operator_checkin(p_activate boolean default false,p_area text default null,p_privacy_confirmed boolean default false)
+returns jsonb language plpgsql security invoker set search_path=public,pg_temp as $$
+declare c public.kb_pilot_config;
+begin
+ select * into c from public.kb_pilot_config where id for update;
+ if p_activate and (not c.retention_approved or not p_privacy_confirmed or length(trim(coalesce(p_area,c.area,'')))<2) then raise exception 'Bekräfta integritetsinformationen och välj pilotområde först.';end if;
+ update public.kb_pilot_config set active=p_activate,area=coalesce(nullif(lower(trim(p_area)),''),area),
+ checked_at=now(),privacy_confirmed=p_privacy_confirmed,
+ starts_at=case when p_activate then coalesce(starts_at,now()) else starts_at end,
+ ends_at=case when p_activate then coalesce(ends_at,now()+interval '14 days') else ends_at end where id returning * into c;
+ return jsonb_build_object('active',c.active,'area',c.area,'ends_at',c.ends_at,'review_due',c.checked_at+interval '24 hours');
+end $$;
+create function public.kb_operator_console() returns jsonb language sql stable security invoker set search_path=public,pg_temp as $$
+select jsonb_build_object('pilot',(select to_jsonb(c) from public.kb_pilot_config c where id),
+ 'participants',(select count(*) from public.kb_pilot_participants),
+ 'pending_reports',(select coalesce(jsonb_agg(jsonb_build_object('id',r.id,'reason',r.reason,'created_at',r.created_at,'listing_id',l.id,'title',l.title,'company',l.company)),'[]'::jsonb) from public.kb_reports r join public.kb_listings l on l.id=r.listing_id where r.status='pending'),
+ 'support',(select coalesce(jsonb_agg(jsonb_build_object('id',id,'category',category,'body',body,'created_at',created_at)),'[]'::jsonb) from public.kb_support_requests where status='pending'),
+ 'metrics',jsonb_build_object('real_listings',(select count(*) from public.kb_listings where not is_test),
+ 'real_completed_exchanges',(select count(*) from public.kb_handoffs h join public.kb_threads t on t.id=h.thread_id join public.kb_listings l on l.id=t.listing_id where not l.is_test and h.status='completed' and h.seller_done and h.buyer_done),
+ 'excluded_qa_listings',(select count(*) from public.kb_listings where is_test)));
+$$;
+create function public.kb_operator_resolve(p_type text,p_id uuid,p_answer text,p_remove boolean default false) returns jsonb language plpgsql security invoker set search_path=public,pg_temp as $$
+declare l uuid;
+begin
+ if length(coalesce(p_answer,'')) not between 3 and 4000 then raise exception 'Skriv en handläggningsnotering eller ett svar.';end if;
+ if p_type='support' then update public.kb_support_requests set answer=p_answer,status='answered',updated_at=now() where id=p_id;
+ elsif p_type='report' then
+  select listing_id into l from public.kb_reports where id=p_id;
+  if p_remove then update public.kb_listings set status='removed',removed_at=now() where id=l;end if;
+  update public.kb_reports set status='reviewed' where id=p_id;
+ else raise exception 'Okänd ärendetyp.';end if;
+ return jsonb_build_object('ok',true);
+end $$;
+revoke all on function public.kb_pilot_admit(text,text,text),public.kb_operator_checkin(boolean,text,boolean),public.kb_operator_console(),public.kb_operator_resolve(text,uuid,text,boolean) from public,anon,authenticated;
+grant execute on function public.kb_pilot_admit(text,text,text),public.kb_operator_checkin(boolean,text,boolean),public.kb_operator_console(),public.kb_operator_resolve(text,uuid,text,boolean) to service_role;
+
+create function public.kb_retention_preview() returns jsonb language sql stable security invoker set search_path=public,pg_temp as $$ select jsonb_build_object('mode','preview_only','listing_bundles_due',(select count(*) from public.kb_listings where expires_at<now()-interval '30 days' or removed_at<now()-interval '30 days'),'reports_due',(select count(*) from public.kb_reports where created_at<now()-interval '180 days'),'support_due',(select count(*) from public.kb_support_requests where updated_at<now()-interval '90 days')); $$;
+revoke all on function public.kb_retention_preview() from public,anon,authenticated;
+grant execute on function public.kb_retention_preview() to service_role;

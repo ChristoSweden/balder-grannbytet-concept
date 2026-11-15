@@ -15,6 +15,11 @@ Deno.serve(async req=>{
  if(origin&&!allowed)return out({error:'Otillåten webbplats.'},403);
  try{
  const url=new URL(req.url),action=url.searchParams.get('action')||'feed';
+ if(req.method==='GET'&&action==='pilot'){
+  const [c]=await db('kb_pilot_config?select=active,company,area,ends_at,checked_at,privacy_confirmed,retention_approved,participant_limit&id=eq.true');
+  const open=!!(c?.active&&c.privacy_confirmed&&c.retention_approved&&c.checked_at&&Date.now()-+new Date(c.checked_at)<86400000&&Date.now()<+new Date(c.ends_at));
+  return out({open,company:c?.company,area:c?.area,ends_at:c?.ends_at,limit:c?.participant_limit||30,message:open?'Kostnadsfri, begränsad pilot. Varor kan ha ett pris.':'Pilotförberedelse: nya annonser och nya kontakter är pausade. Läsning, befintliga samtal och support fungerar.'});
+ }
  if(req.method==='GET'&&action==='areas'){
   const company=url.searchParams.get('company');if(!companies.includes(company))return out({error:'Välj bolag.'},400);
   const rows=await db('kb_listings?select=building&company=eq.'+company+'&status=in.(active,reserved)&limit=500');return out({areas:[...new Set(rows.map(x=>x.building))].sort().slice(0,100)});
@@ -34,6 +39,14 @@ Deno.serve(async req=>{
  }
  const token=req.headers.get('x-device-key')||'';if(!/^[a-f0-9]{64}$/.test(token))return out({error:'Din privata webbläsarnyckel saknas.'},401);
  const me=await digest(token);
+ if(req.method==='GET'&&action==='support')return out({cases:await db('kb_support_requests?select=id,category,body,answer,status,created_at,updated_at&owner_hash=eq.'+me+'&order=created_at.desc&limit=30')});
+ if(req.method==='GET'&&action==='export'){
+  const listings=await db('kb_listings?select='+publicFields+'&owner_hash=eq.'+me);
+  const threads=await db('kb_threads?select=id,listing_id,buyer_name,created_at&or=(seller_hash.eq.'+me+',buyer_hash.eq.'+me+')&limit=100');
+  for(const t of threads){const messages=await db('kb_messages?thread_id=eq.'+t.id+'&order=created_at.asc&limit=500');t.messages=messages.map(x=>({body:x.body,created_at:x.created_at,mine:x.sender_hash===me}))}
+  const cases=await db('kb_support_requests?select=id,category,body,answer,status,created_at&owner_hash=eq.'+me);
+  return out({exported_at:new Date().toISOString(),listings,threads,support:cases,note:'Export av uppgifter som kan nås med denna privata webbläsarnyckel. Återställningsnyckeln ingår inte.'});
+ }
  if(req.method==='GET'&&action==='handoff'){
   const id=url.searchParams.get('thread');if(!uuid(id))return out({error:'Ogiltig konversation.'},400);
   const ts=await db('kb_threads?id=eq.'+id+'&or=(seller_hash.eq.'+me+',buyer_hash.eq.'+me+')');const t=ts[0];if(!t)return out({error:'Konversationen hittades inte.'},404);
@@ -56,6 +69,10 @@ Deno.serve(async req=>{
  const ip=req.headers.get('x-forwarded-for')?.split(',')[0].trim()||'unknown';
  const iphash=await digest(secret+new Date().toISOString().slice(0,10)+ip);
  if(!await db('rpc/kb_rate','POST',{p_actor:'ip:'+iphash,p_limit:100})||!await db('rpc/kb_rate','POST',{p_actor:'device:'+me,p_limit:35}))return out({error:'För många försök. Försök igen om en timme.'},429);
+ if(action==='support'){
+  if(!['support','privacy','abuse'].includes(b.category)||!text(b.body,5,2000))return out({error:'Välj ärendetyp och beskriv ditt ärende (5–2000 tecken).'},400);
+  const row=await db('kb_support_requests?select=id,status,created_at','POST',{owner_hash:me,category:b.category,body:b.body.trim()});return out({case:row[0]},201);
+ }
  if(action==='handoff'){
   if(!uuid(b.thread)||!['propose','agree','cancel','complete','feedback'].includes(b.action))return out({error:'Ogiltig överlämning.'},400);
   try{return out(await db('rpc/kb_handoff_action','POST',{p_hash:me,p_thread:b.thread,p_action:b.action,p_data:b.data||{}}))}catch{return out({error:'Åtgärden kunde inte genomföras. Kontrollera aktuell status, mötesplats och tid. En annan person kan redan ha reserverat saken.'},409)}
@@ -70,17 +87,19 @@ Deno.serve(async req=>{
    if(!uuid(b.id))return out({error:'Ogiltig annons.'},400);
    const result=await db('kb_listings?id=eq.'+b.id+'&owner_hash=eq.'+me+'&company=eq.'+b.company+'&status=eq.active&select='+publicFields,'PATCH',row);return result.length?out({listing:result[0]}):out({error:'Bara egna, aktiva annonser kan ändras. Avboka en överlämning först.'},403);
   }
+  const admission=await db('rpc/kb_pilot_admit','POST',{p_hash:me,p_company:row.company,p_area:row.building});if(!admission.allowed)return out({error:admission.reason},423);
+  row.is_test=/^QA[ _]/.test(row.title);
   const result=await db('kb_listings?select='+publicFields,'POST',row);return out({listing:result[0]},201);
  }
  if(action==='close'||action==='remove'){
   if(!uuid(b.id))return out({error:'Ogiltig annons.'},400);
-  const rows=await db('kb_listings?id=eq.'+b.id+'&owner_hash=eq.'+me+'&status=neq.reserved&select=id','PATCH',{status:action==='close'?'closed':'removed'});return rows.length?out({ok:true}):out({error:'Annonsen tillhör inte denna webbläsare, eller har en bekräftad överlämning som först måste avbokas.'},403);
+  const rows=await db('kb_listings?id=eq.'+b.id+'&owner_hash=eq.'+me+'&status=neq.reserved&select=id','PATCH',{status:action==='close'?'closed':'removed',...(action==='remove'?{removed_at:new Date().toISOString()}:{})});return rows.length?out({ok:true}):out({error:'Annonsen tillhör inte denna webbläsare, eller har en bekräftad överlämning som först måste avbokas.'},403);
  }
  if(action==='contact'){
   if(!uuid(b.id)||!text(b.name,1,40)||!text(b.body,1,1200))return out({error:'Fyll i namn och meddelande.'},400);
   const ls=await db('kb_listings?id=eq.'+b.id+'&status=eq.active&expires_at=gt.'+encodeURIComponent(new Date().toISOString()));const l=ls[0];if(!l)return out({error:'Annonsen är inte längre tillgänglig.'},404);if(l.owner_hash===me)return out({error:'Det här är din egen annons.'},400);
   const blocks=await db('kb_blocks?or=(and(blocker_hash.eq.'+l.owner_hash+',blocked_hash.eq.'+me+'),and(blocker_hash.eq.'+me+',blocked_hash.eq.'+l.owner_hash+'))');if(blocks.length)return out({error:'Kontakten är blockerad.'},403);
-  let ts=await db('kb_threads?listing_id=eq.'+b.id+'&buyer_hash=eq.'+me);if(!ts.length){try{ts=await db('kb_threads','POST',{listing_id:b.id,seller_hash:l.owner_hash,buyer_hash:me,buyer_name:b.name.trim()})}catch{ts=await db('kb_threads?listing_id=eq.'+b.id+'&buyer_hash=eq.'+me)}}
+  let ts=await db('kb_threads?listing_id=eq.'+b.id+'&buyer_hash=eq.'+me);if(!ts.length){const admission=await db('rpc/kb_pilot_admit','POST',{p_hash:me,p_company:l.company,p_area:l.building});if(!admission.allowed)return out({error:admission.reason},423);try{ts=await db('kb_threads','POST',{listing_id:b.id,seller_hash:l.owner_hash,buyer_hash:me,buyer_name:b.name.trim()})}catch{ts=await db('kb_threads?listing_id=eq.'+b.id+'&buyer_hash=eq.'+me)}}
   await db('kb_messages','POST',{thread_id:ts[0].id,sender_hash:me,body:b.body.trim()});return out({thread:ts[0].id},201);
  }
  if(['reply','block'].includes(action)){
