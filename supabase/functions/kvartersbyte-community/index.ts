@@ -15,25 +15,29 @@ Deno.serve(async req=>{
  if(origin&&!allowed)return out({error:'Otillåten webbplats.'},403);
  try{
  const url=new URL(req.url),action=url.searchParams.get('action')||'feed';
+ if(req.method==='GET'&&action==='listing'){
+  const id=url.searchParams.get('id'),company=url.searchParams.get('company');if(!uuid(id)||!companies.includes(company))return out({error:'Ogiltig annonslänk.'},400);
+  const rows=await db('kb_listings?select='+publicFields+'&id=eq.'+id+'&company=eq.'+company+'&status=eq.active&expires_at=gt.'+encodeURIComponent(new Date().toISOString()));return rows.length?out({listing:rows[0]}):out({error:'Annonsen har avslutats eller finns inte längre.'},404);
+ }
  if(req.method==='GET'&&action==='feed'){
   const company=url.searchParams.get('company');if(!companies.includes(company))return out({error:'Välj fastighetsbolag.'},400);
   const building=(url.searchParams.get('building')||'').trim().toLocaleLowerCase('sv');if(building.length>80)return out({error:'Ogiltigt område.'},400);
   let filter='company=eq.'+company+'&status=eq.active&expires_at=gt.'+encodeURIComponent(new Date().toISOString());
   // Filtering is not membership authorization. Only company-wide posts cross building filters.
   if(building)filter+='&or='+encodeURIComponent('(scope.eq.company,building.eq.'+JSON.stringify(building)+')');
-  const rows=await db('kb_listings?select='+publicFields+'&'+filter+'&order=created_at.desc&limit=40');return out({listings:rows});
+  const ids=url.searchParams.get('ids');if(ids!==null){const list=ids.split(',');if(list.length>100||!list.every(uuid))return out({error:'Ogiltiga sparade annonser.'},400);filter+='&id=in.('+list.join(',')+')'}
+  const rows=await db('kb_listings?select='+publicFields+'&'+filter+'&order=created_at.desc&limit='+(ids?100:40));return out({listings:rows});
  }
  const token=req.headers.get('x-device-key')||'';if(!/^[a-f0-9]{64}$/.test(token))return out({error:'Din privata webbläsarnyckel saknas.'},401);
  const me=await digest(token);
  if(req.method==='GET'&&action==='mine')return out({listings:await db('kb_listings?select='+publicFields+'&owner_hash=eq.'+me+'&status=neq.removed&order=created_at.desc&limit=100')});
  if(req.method==='GET'&&action==='inbox'){
-  const threads=await db('kb_threads?select=id,listing_id,buyer_name,created_at&or=(seller_hash.eq.'+me+',buyer_hash.eq.'+me+')&order=created_at.desc&limit=60');
-  for(const t of threads){const l=await db('kb_listings?select=title,nickname,company&id=eq.'+t.listing_id);t.listing=l[0]||null}return out({threads});
+  const threads=await db('rpc/kb_inbox','POST',{p_hash:me});return out({threads});
  }
  if(req.method==='GET'&&action==='messages'){
   const id=url.searchParams.get('thread');if(!uuid(id))return out({error:'Ogiltig konversation.'},400);
   const ts=await db('kb_threads?id=eq.'+id+'&or=(seller_hash.eq.'+me+',buyer_hash.eq.'+me+')');if(!ts.length)return out({error:'Konversationen hittades inte.'},404);
-  const rows=await db('kb_messages?thread_id=eq.'+id+'&order=created_at.asc&limit=150');return out({messages:rows.map(x=>({id:x.id,body:x.body,mine:x.sender_hash===me,created_at:x.created_at}))});
+  const rows=await db('kb_messages?thread_id=eq.'+id+'&order=created_at.desc,id.desc&limit=150');return out({messages:rows.reverse().map(x=>({id:x.id,body:x.body,mine:x.sender_hash===me,created_at:x.created_at}))});
  }
  if(req.method!=='POST')return out({error:'Okänd åtgärd.'},404);
  const raw=await req.text();if(raw.length>190000)return out({error:'Bilden eller texten är för stor.'},413);

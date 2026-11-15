@@ -77,3 +77,16 @@ begin
 end $$;
 revoke all on function public.kb_rate(text,integer) from public,anon,authenticated;
 grant execute on function public.kb_rate(text,integer) to service_role;
+create function public.kb_inbox(p_hash text) returns jsonb language sql stable security invoker set search_path=public,pg_temp as $$
+select coalesce(jsonb_agg(q.item order by q.activity desc),'[]'::jsonb) from (
+ select jsonb_build_object('id',t.id,'listing_id',t.listing_id,'buyer_name',t.buyer_name,'created_at',t.created_at,
+ 'last_received_at',m.last_received_at,'listing',jsonb_build_object('title',l.title,'nickname',l.nickname,'company',l.company)) as item,
+ coalesce(m.last_at,t.created_at) as activity
+ from public.kb_threads t join public.kb_listings l on l.id=t.listing_id
+ left join lateral (select max(created_at) as last_at,max(created_at) filter(where sender_hash<>p_hash) as last_received_at from public.kb_messages where thread_id=t.id) m on true
+ where t.seller_hash=p_hash or t.buyer_hash=p_hash
+ order by coalesce(m.last_at,t.created_at) desc limit 60
+) q;
+$$;
+revoke all on function public.kb_inbox(text) from public,anon,authenticated;
+grant execute on function public.kb_inbox(text) to service_role;

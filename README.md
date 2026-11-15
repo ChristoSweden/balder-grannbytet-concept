@@ -39,3 +39,7 @@ JavaScript syntax checks and real deployed API tests cover shared publication, c
 ## Deployment
 
 Vercel project `prj_175K9DY56QqBj2DOw8XVpaPte1bP`, team `team_W6OPn2e8psbMOj4XJCcJ3iXo`, production `https://kvartersbyte-independent.vercel.app/`. Deploy only `index.html`, `community.css`, `community.js`, and `vercel.json`; never deploy backend source or database migrations as static files. Source remains on branch `independent-launch-20261115` of the original concept repository; the original main branch remains intact.
+
+## Sharing and return visits
+
+Company routes `/finnvedsbostader`, `/balder`, `/nivika`, `/heimstaden` rewrite to the common app with company-specific feed context. `?listing=<id>` opens an active shared listing, fetched independently of the most recent 40 feed items. Company and building links use native sharing when available, with clipboard/manual fallback. Favourites are local to the device, limited to 100, and fetched within the selected company. Inbox summaries are private, use a service-role-only SECURITY INVOKER function, and expose last inbound timestamps. The client checks for unread conversations on load, on return to the page, and every 60 seconds while visible. No background push/email is claimed.
