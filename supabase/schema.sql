@@ -90,3 +90,82 @@ select coalesce(jsonb_agg(q.item order by q.activity desc),'[]'::jsonb) from (
 $$;
 revoke all on function public.kb_inbox(text) from public,anon,authenticated;
 grant execute on function public.kb_inbox(text) to service_role;
+alter table public.kb_listings add column deadline timestamptz,
+ add column dimensions text not null default '' check(length(dimensions)<=100),
+ add column floor_info text not null default '' check(length(floor_info)<=100),
+ add column lift_available boolean,
+ add column carrying_help boolean not null default false,
+ add column collection_notes text not null default '' check(length(collection_notes)<=300),
+ add column reserved_thread_id uuid references public.kb_threads(id);
+alter table public.kb_listings drop constraint kb_listings_status_check;
+alter table public.kb_listings add constraint kb_listings_status_check check(status in ('active','reserved','closed','removed'));
+create table public.kb_handoffs(
+ id uuid primary key default gen_random_uuid(),thread_id uuid not null unique references public.kb_threads(id),
+ starts_at timestamptz not null,ends_at timestamptz not null check(ends_at>starts_at),
+ meeting text not null check(length(meeting) between 2 and 200),proposer_hash text not null,
+ status text not null default 'proposed' check(status in ('proposed','agreed','cancelled','completed')),
+ seller_done boolean not null default false,buyer_done boolean not null default false,
+ created_at timestamptz not null default now(),updated_at timestamptz not null default now()
+);
+create table public.kb_feedback(
+ handoff_id uuid not null references public.kb_handoffs(id),author_hash text not null,subject_hash text not null,
+ rating integer not null check(rating between 1 and 5),created_at timestamptz not null default now(),
+ primary key(handoff_id,author_hash),check(author_hash<>subject_hash)
+);
+create index kb_feedback_subject on public.kb_feedback(subject_hash);
+alter table public.kb_handoffs enable row level security;
+alter table public.kb_feedback enable row level security;
+revoke all on public.kb_handoffs,public.kb_feedback from public,anon,authenticated;
+grant all on public.kb_handoffs,public.kb_feedback to service_role;
+create function public.kb_handoff_action(p_hash text,p_thread uuid,p_action text,p_data jsonb default '{}'::jsonb)
+returns jsonb language plpgsql security invoker set search_path=public,pg_temp as $$
+declare t public.kb_threads; l public.kb_listings; h public.kb_handoffs; msg text; other_hash text; s timestamptz; e timestamptz;
+begin
+ select * into t from public.kb_threads where id=p_thread and (seller_hash=p_hash or buyer_hash=p_hash) for update;
+ if not found then raise exception 'Konversationen hittades inte.';end if;
+ select * into l from public.kb_listings where id=t.listing_id for update;
+ other_hash:=case when t.seller_hash=p_hash then t.buyer_hash else t.seller_hash end;
+ if exists(select 1 from public.kb_blocks where (blocker_hash=p_hash and blocked_hash=other_hash) or (blocker_hash=other_hash and blocked_hash=p_hash)) then raise exception 'Kontakten är blockerad.';end if;
+ select * into h from public.kb_handoffs where thread_id=p_thread for update;
+ if p_action='propose' then
+  if l.status not in ('active','reserved') or (l.reserved_thread_id is not null and l.reserved_thread_id<>p_thread) then raise exception 'Annonsen är inte tillgänglig.';end if;
+  if h.status in ('agreed','completed') then raise exception 'Avboka befintlig tid innan du föreslår en ny.';end if;
+  s:=(p_data->>'starts_at')::timestamptz;e:=(p_data->>'ends_at')::timestamptz;
+  if s is null or e is null or s<now() or s>now()+interval '60 days' or e<=s or e>s+interval '8 hours' or length(trim(coalesce(p_data->>'meeting','')))<2 or length(p_data->>'meeting')>200 then raise exception 'Välj en framtida tid och en mötesplats.';end if;
+  if l.deadline is not null and s>l.deadline then raise exception 'Tiden ligger efter annonsens sista hämtdatum.';end if;
+  insert into public.kb_handoffs(thread_id,starts_at,ends_at,meeting,proposer_hash) values(p_thread,s,e,trim(p_data->>'meeting'),p_hash)
+  on conflict(thread_id) do update set starts_at=excluded.starts_at,ends_at=excluded.ends_at,meeting=excluded.meeting,proposer_hash=p_hash,status='proposed',seller_done=false,buyer_done=false,updated_at=now() returning * into h;
+  msg:='Föreslog en tid för överlämning. Öppna överlämningsplanen för detaljer.';
+ elsif p_action='agree' then
+  if h.id is null or h.status<>'proposed' or h.proposer_hash=p_hash or h.ends_at<now() then raise exception 'Tiden kan inte bekräftas.';end if;
+  if l.status not in ('active','reserved') or (l.reserved_thread_id is not null and l.reserved_thread_id<>p_thread) then raise exception 'Annonsen har redan reserverats eller avslutats.';end if;
+  update public.kb_handoffs set status='agreed',updated_at=now() where id=h.id returning * into h;
+  update public.kb_listings set status='reserved',reserved_thread_id=p_thread where id=l.id;
+  msg:='Bekräftade överlämningstiden. Annonsen är reserverad för denna överlämning.';
+ elsif p_action='cancel' then
+  if h.id is null or h.status not in ('proposed','agreed') then raise exception 'Ingen aktiv överlämning att avboka.';end if;
+  update public.kb_handoffs set status='cancelled',updated_at=now() where id=h.id returning * into h;
+  update public.kb_listings set status=case when status='reserved' then 'active' else status end,reserved_thread_id=null where id=l.id and reserved_thread_id=p_thread;
+  msg:='Avbokade överlämningstiden. Bestäm en ny tid i konversationen.';
+ elsif p_action='complete' then
+  if h.id is null or h.status<>'agreed' or l.reserved_thread_id is distinct from p_thread then raise exception 'Bekräfta först en gemensam tid.';end if;
+  update public.kb_handoffs set seller_done=seller_done or t.seller_hash=p_hash,buyer_done=buyer_done or t.buyer_hash=p_hash,updated_at=now() where id=h.id returning * into h;
+  if h.seller_done and h.buyer_done then
+   update public.kb_handoffs set status='completed',updated_at=now() where id=h.id returning * into h;
+   update public.kb_listings set status='closed',reserved_thread_id=null where id=l.id;
+   msg:='Båda har bekräftat överlämningen. Annonsen är avslutad.';
+  else msg:='Har bekräftat att överlämningen är genomförd. Väntar på den andra personen.';end if;
+ elsif p_action='feedback' then
+  if h.id is null or h.status<>'completed' or (p_data->>'rating') is null or (p_data->>'rating')::integer not between 1 and 5 then raise exception 'Omdöme kräver en överlämning som båda har bekräftat.';end if;
+  insert into public.kb_feedback(handoff_id,author_hash,subject_hash,rating) values(h.id,p_hash,other_hash,(p_data->>'rating')::integer) on conflict do nothing;
+ else raise exception 'Okänd överlämningsåtgärd.';end if;
+ if msg is not null then insert into public.kb_messages(thread_id,sender_hash,body) values(p_thread,p_hash,msg);end if;
+ return jsonb_build_object('ok',true,'status',h.status);
+end $$;
+revoke all on function public.kb_handoff_action(text,uuid,text,jsonb) from public,anon,authenticated;
+grant execute on function public.kb_handoff_action(text,uuid,text,jsonb) to service_role;
+create function public.kb_reputation(p_listing uuid) returns jsonb language sql stable security invoker set search_path=public,pg_temp as $$
+select jsonb_build_object('reviews',count(f.rating),'average',round(avg(f.rating),1)) from public.kb_listings l left join public.kb_feedback f on f.subject_hash=l.owner_hash where l.id=p_listing;
+$$;
+revoke all on function public.kb_reputation(uuid) from public,anon,authenticated;
+grant execute on function public.kb_reputation(uuid) to service_role;

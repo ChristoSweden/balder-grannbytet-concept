@@ -40,6 +40,16 @@ JavaScript syntax checks and real deployed API tests cover shared publication, c
 
 Vercel project `prj_175K9DY56QqBj2DOw8XVpaPte1bP`, team `team_W6OPn2e8psbMOj4XJCcJ3iXo`, production `https://kvartersbyte-independent.vercel.app/`. Deploy only `index.html`, `community.css`, `community.js`, and `vercel.json`; never deploy backend source or database migrations as static files. Source remains on branch `independent-launch-20261115` of the original concept repository; the original main branch remains intact.
 
-## Sharing and return visits
+## Collection quality release
 
-Company routes `/finnvedsbostader`, `/balder`, `/nivika`, `/heimstaden` rewrite to the common app with company-specific feed context. `?listing=<id>` opens an active shared listing, fetched independently of the most recent 40 feed items. Company and building links use native sharing when available, with clipboard/manual fallback. Favourites are local to the device, limited to 100, and fetched within the selected company. Inbox summaries are private, use a service-role-only SECURITY INVOKER function, and expose last inbound timestamps. The client checks for unread conversations on load, on return to the page, and every 60 seconds while visible. No background push/email is claimed.
+Request-first navigation and a request board surface neighbours' wanted posts. Optional wanted-post alerts operate only while this page is open and visible; browser notifications require explicit opt-in and browser support. No email, background push or verified-identity service is configured.
+
+Listings now carry optional deadline (also limits public expiry), dimensions, accessibility/floor/lift details, carrying-help flag and non-sensitive collection notes. Owners can edit active listings. Reserved listings require cancelling the handoff before editing/removal.
+
+Collection transitions use the service-only SECURITY INVOKER `kb_handoff_action` function. It locks the thread and listing, validates both participants and blocks, prevents competing reservations, requires the other participant to agree, and records bilateral completion. Cancellation frees reservations. Each participant can leave one numeric review only after mutual completion. Public reputation exposes only aggregate ratings from those reviews; no identity or tenancy verification is implied. Private meeting places never enter public listing fields. Calendar export includes the agreed appointment and a one-hour alarm; calendar import is a resident action.
+
+Access recovery is an optional local download of the 256-bit device capability, not an email account or identity check. Restoring the code on another browser switches to that identity; identities are not merged. Treat the code as a password. No real recovery code is stored in source or deployment configuration.
+
+Quality validation: live API lifecycle tests passed for metadata, owner-only editing, two-person agreement, competing-reservation rejection, private meeting access, reservation guards, unilateral versus bilateral completion, feedback eligibility, aggregate reputation, cancellation/reopening and ownership with the same recovered capability. New tables have RLS and no browser grants; RPC execute is service-role-only.
+
+Operator outcome measures can be computed from listing creation, first incoming message and mutually confirmed handoff timestamps. Do not describe page views as successful exchanges or claim a 100x improvement without observed pilot data.
